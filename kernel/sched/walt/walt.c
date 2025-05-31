@@ -7,10 +7,11 @@
 #include <linux/list_sort.h>
 #include <linux/jiffies.h>
 #include <linux/sched/stat.h>
-#include <trace/events/sched.h>
+#include <linux/qcom-cpufreq-hw.h>
 #include "qc_vas.h"
 
 #include <trace/events/sched.h>
+#include <trace/events/power.h>
 
 const char *task_event_names[] = {"PUT_PREV_TASK", "PICK_NEXT_TASK",
 				  "TASK_WAKE", "TASK_MIGRATE", "TASK_UPDATE",
@@ -43,14 +44,10 @@ const char *migrate_type_names[] = {"GROUP_TO_RQ", "RQ_TO_GROUP",
 
 static ktime_t ktime_last;
 static bool sched_ktime_suspended;
-static struct cpu_cycle_counter_cb cpu_cycle_counter_cb;
 static bool use_cycle_counter;
-static DEFINE_MUTEX(cluster_lock);
 static atomic64_t walt_irq_work_lastq_ws;
 static u64 walt_load_reported_window;
 static DEFINE_PER_CPU(atomic64_t, prev_group_runnable_sum) = ATOMIC64_INIT(0);
-static DEFINE_PER_CPU(atomic64_t, cycles) = ATOMIC64_INIT(0);
-static DEFINE_PER_CPU(atomic64_t, last_cc_update) = ATOMIC64_INIT(0);
 
 static struct irq_work walt_cpufreq_irq_work;
 static struct irq_work walt_migration_irq_work;
@@ -416,19 +413,17 @@ update_window_start(struct rq *rq, u64 wallclock, int event)
 	return old_window_start;
 }
 
-#define THRESH_CC_UPDATE (2 * NSEC_PER_USEC)
+
 static inline u64 read_cycle_counter(int cpu, u64 wallclock)
 {
-	u64 delta;
+	struct walt_rq *wrq = (struct walt_rq *) &cpu_rq(cpu)->wrq;
 
-	delta = wallclock - atomic64_read(&per_cpu(last_cc_update, cpu));
-	if (delta > THRESH_CC_UPDATE) {
-		atomic64_set(&per_cpu(cycles, cpu),
-			cpu_cycle_counter_cb.get_cpu_cycle_counter(cpu));
-		atomic64_set(&per_cpu(last_cc_update, cpu), wallclock);
+	if (wrq->last_cc_update != wallclock) {
+		wrq->cycles = qcom_cpufreq_get_cpu_cycle_counter(cpu);
+		wrq->last_cc_update = wallclock;
 	}
 
-	return atomic64_read(&per_cpu(cycles, cpu));
+	return wrq->cycles;
 }
 
 static void update_task_cpu_cycles(struct task_struct *p, int cpu,
@@ -795,11 +790,6 @@ static void update_rq_load_subtractions(int index, struct rq *rq,
 	rq->wrq.load_subs[index].subs +=  sub_load;
 	if (new_task)
 		rq->wrq.load_subs[index].new_subs += sub_load;
-}
-
-static inline struct walt_sched_cluster *cpu_cluster(int cpu)
-{
-	return cpu_rq(cpu)->wrq.cluster;
 }
 
 void update_cluster_load_subtractions(struct task_struct *p,
@@ -2439,12 +2429,23 @@ static struct walt_sched_cluster init_cluster = {
 	.aggr_grp_load		= 0,
 };
 
+static void walt_cpu_frequency_limits(void *unused, struct cpufreq_policy *policy)
+{
+	cpu_cluster(policy->cpu)->max_freq = policy->max;
+}
+
 void init_clusters(void)
 {
 	init_cluster.cpus = *cpu_possible_mask;
 	raw_spin_lock_init(&init_cluster.load_lock);
 	INIT_LIST_HEAD(&cluster_head);
 	list_add(&init_cluster.list, &cluster_head);
+
+	/* Upstream walt has initialisation sorted
+	 * But, msm-5.4 is a massacre just put trace hook
+	 * registration here and call it day
+	 */
+	register_trace_cpu_frequency_limits(walt_cpu_frequency_limits, NULL);
 }
 
 static void
@@ -2475,6 +2476,7 @@ static struct walt_sched_cluster *alloc_new_cluster(const struct cpumask *cpus)
 
 	INIT_LIST_HEAD(&cluster->list);
 	cluster->cur_freq		=	1;
+	cluster->max_freq		=	1;
 	cluster->max_possible_freq	=	1;
 
 	raw_spin_lock_init(&cluster->load_lock);
@@ -2696,6 +2698,7 @@ void walt_update_cluster_topology(void)
 
 		if (policy) {
 			cluster->max_possible_freq = policy->cpuinfo.max_freq;
+			cluster->max_freq = policy->max;
 
 			for_each_cpu(i, &cluster->cpus)
 				cpumask_copy(&cpu_rq(i)->wrq.freq_domain_cpumask,
@@ -2784,6 +2787,11 @@ static struct notifier_block notifier_trans_block = {
 
 static int register_walt_callback(void)
 {
+	if (qcom_cpufreq_get_cpu_cycle_counter(smp_processor_id()) != U64_MAX) {
+		use_cycle_counter = true;
+		return 0;
+	}
+
 	return cpufreq_register_notifier(&notifier_trans_block,
 					CPUFREQ_TRANSITION_NOTIFIER);
 }
@@ -2794,28 +2802,6 @@ static int register_walt_callback(void)
  * for further information.
  */
 core_initcall(register_walt_callback);
-
-int register_cpu_cycle_counter_cb(struct cpu_cycle_counter_cb *cb)
-{
-	unsigned long flags;
-
-	mutex_lock(&cluster_lock);
-	if (!cb->get_cpu_cycle_counter) {
-		mutex_unlock(&cluster_lock);
-		return -EINVAL;
-	}
-
-	acquire_rq_locks_irqsave(cpu_possible_mask, &flags);
-	cpu_cycle_counter_cb = *cb;
-	use_cycle_counter = true;
-	release_rq_locks_irqrestore(cpu_possible_mask, &flags);
-
-	mutex_unlock(&cluster_lock);
-
-	cpufreq_unregister_notifier(&notifier_trans_block,
-				    CPUFREQ_TRANSITION_NOTIFIER);
-	return 0;
-}
 
 static void transfer_busy_time(struct rq *rq,
 				struct walt_related_thread_group *grp,
@@ -3245,39 +3231,6 @@ static bool is_cluster_hosting_top_app(struct walt_sched_cluster *cluster)
 			(sched_boost_policy() != SCHED_BOOST_ON_BIG);
 
 	return (is_min_capacity_cluster(cluster) == grp_on_min);
-}
-
-static unsigned long thermal_cap_cpu[NR_CPUS];
-
-unsigned long thermal_cap(int cpu)
-{
-	return thermal_cap_cpu[cpu] ?: SCHED_CAPACITY_SCALE;
-}
-
-static inline unsigned long
-do_thermal_cap(int cpu, unsigned long thermal_max_freq)
-{
-	if (unlikely(!walt_clusters_parsed))
-		return capacity_orig_of(cpu);
-
-	return mult_frac(arch_scale_cpu_capacity(cpu), thermal_max_freq,
-			cpu_max_possible_freq(cpu));
-}
-
-static DEFINE_SPINLOCK(cpu_freq_min_max_lock);
-void sched_update_cpu_freq_min_max(const cpumask_t *cpus, u32 fmin, u32 fmax)
-{
-	struct cpumask cpumask;
-	int i;
-	unsigned long flags;
-
-	spin_lock_irqsave(&cpu_freq_min_max_lock, flags);
-	cpumask_copy(&cpumask, cpus);
-
-	for_each_cpu(i, &cpumask)
-		thermal_cap_cpu[i] = do_thermal_cap(i, fmax);
-
-	spin_unlock_irqrestore(&cpu_freq_min_max_lock, flags);
 }
 
 void note_task_waking(struct task_struct *p, u64 wallclock)
