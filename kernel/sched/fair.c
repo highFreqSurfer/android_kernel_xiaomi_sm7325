@@ -7118,7 +7118,6 @@ compute_energy(struct task_struct *p, int dst_cpu, struct perf_domain *pd)
 	unsigned long cpu_cap = arch_scale_cpu_capacity(cpumask_first(pd_mask));
 #endif
 	unsigned long max_util = 0, sum_util = 0;
-	unsigned long energy = 0;
 	int cpu;
 	unsigned long cpu_util;
 
@@ -7161,11 +7160,7 @@ compute_energy(struct task_struct *p, int dst_cpu, struct perf_domain *pd)
 		max_util = max(max_util, cpu_util);
 	}
 
-	trace_android_vh_em_pd_energy(pd->em_pd, max_util, sum_util, &energy);
-	if (!energy)
-		energy = em_pd_energy(pd->em_pd, max_util, sum_util);
-
-	return energy;
+	return em_cpu_energy(pd->em_pd, max_util, sum_util);
 }
 
 #ifdef CONFIG_SCHED_WALT

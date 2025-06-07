@@ -31,7 +31,7 @@
 #define CLK_HW_DIV			2
 #define GT_IRQ_STATUS			BIT(2)
 #define MAX_FN_SIZE			20
-#define LIMITS_POLLING_DELAY_MS		10
+#define LIMITS_POLLING_DELAY_MS		4
 #define MAX_ROW				2
 
 #define CYCLE_CNTR_OFFSET(core_id, m, acc_count)				\
@@ -255,8 +255,6 @@ qcom_cpufreq_hw_target_index(struct cpufreq_policy *policy,
 		writel_relaxed(freq / 1000, c->sdpm_base[i]);
 
 	writel_relaxed(index, policy->driver_data + offsets[REG_PERF_STATE]);
-	arch_set_freq_scale(policy->related_cpus, freq,
-			    policy->cpuinfo.max_freq);
 
 	for (i = 0; i < c->sdpm_base_count && freq < policy->cur; i++)
 		writel_relaxed(freq / 1000, c->sdpm_base[i]);
@@ -325,7 +323,7 @@ static int qcom_cpufreq_hw_cpu_init(struct cpufreq_policy *policy)
 	policy->fast_switch_possible = true;
 	policy->dvfs_possible_from_any_cpu = true;
 
-	dev_pm_opp_of_register_em(policy->cpus);
+	dev_pm_opp_of_register_em(cpu_dev, policy->cpus);
 
 	if (c->dcvsh_irq > 0 && !c->is_irq_requested) {
 		snprintf(c->dcvsh_irq_name, sizeof(c->dcvsh_irq_name),
@@ -457,6 +455,9 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 		lval = FIELD_GET(LUT_L_VAL, data);
 		core_count = FIELD_GET(LUT_CORE_COUNT, data);
 
+		if (of_device_is_compatible(dev->of_node, "qcom,cpufreq-hw-epss"))
+			core_count = FIELD_GET(GENMASK(19, 16), data);
+
 		data = readl_relaxed(c->base + offsets[REG_VOLT_LUT] +
 				      i * lut_row_size);
 		volt = FIELD_GET(LUT_VOLT, data) * 1000;
@@ -473,11 +474,8 @@ static int qcom_cpufreq_hw_read_lut(struct platform_device *pdev,
 		if (core_count != max_cores)
 			c->table[i].flags  = CPUFREQ_BOOST_FREQ;
 
-		/*
-		 * Two of the same frequencies with the same core counts means
-		 * end of table.
-		 */
-		if (i > 0 && prev_freq == freq && prev_cc == core_count)
+		/* Two of the same frequencies means end of table. */
+		if (i > 0 && prev_freq == freq)
 			break;
 
 		prev_cc = core_count;
@@ -613,7 +611,7 @@ static int qcom_cpu_resources_init(struct platform_device *pdev,
 		c->dcvsh_irq = of_irq_get(dev->of_node, index);
 		if (c->dcvsh_irq > 0) {
 			mutex_init(&c->dcvsh_lock);
-			INIT_DEFERRABLE_WORK(&c->freq_poll_work,
+			INIT_DELAYED_WORK(&c->freq_poll_work,
 					limits_dcvsh_poll);
 		}
 	}

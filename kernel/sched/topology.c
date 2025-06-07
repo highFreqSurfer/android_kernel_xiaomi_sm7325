@@ -207,6 +207,15 @@ unsigned int sysctl_sched_energy_aware = 1;
 DEFINE_MUTEX(sched_energy_mutex);
 bool sched_energy_update;
 
+void rebuild_sched_domains_energy(void)
+{
+	mutex_lock(&sched_energy_mutex);
+	sched_energy_update = true;
+	rebuild_sched_domains();
+	sched_energy_update = false;
+	mutex_unlock(&sched_energy_mutex);
+}
+
 #ifdef CONFIG_PROC_SYSCTL
 int sched_energy_aware_handler(struct ctl_table *table, int write,
 			 void __user *buffer, size_t *lenp, loff_t *ppos)
@@ -219,13 +228,8 @@ int sched_energy_aware_handler(struct ctl_table *table, int write,
 	ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
 	if (!ret && write) {
 		state = static_branch_unlikely(&sched_energy_present);
-		if (state != sysctl_sched_energy_aware) {
-			mutex_lock(&sched_energy_mutex);
-			sched_energy_update = 1;
-			rebuild_sched_domains();
-			sched_energy_update = 0;
-			mutex_unlock(&sched_energy_mutex);
-		}
+		if (state != sysctl_sched_energy_aware)
+			rebuild_sched_domains_energy();
 	}
 
 	return ret;
@@ -282,10 +286,10 @@ static void perf_domain_debug(const struct cpumask *cpu_map,
 	printk(KERN_DEBUG "root_domain %*pbl:", cpumask_pr_args(cpu_map));
 
 	while (pd) {
-		printk(KERN_CONT " pd%d:{ cpus=%*pbl nr_cstate=%d }",
+		printk(KERN_CONT " pd%d:{ cpus=%*pbl nr_pstate=%d }",
 				cpumask_first(perf_domain_span(pd)),
 				cpumask_pr_args(perf_domain_span(pd)),
-				em_pd_nr_cap_states(pd->em_pd));
+				em_pd_nr_perf_states(pd->em_pd));
 		pd = pd->next;
 	}
 
@@ -318,28 +322,30 @@ static void sched_energy_set(bool has_eas)
  *    1. an Energy Model (EM) is available;
  *    2. the SD_ASYM_CPUCAPACITY flag is set in the sched_domain hierarchy.
  *    3. the EM complexity is low enough to keep scheduling overheads low;
+ of the rd;
+ *    4. frequency invariance support is present;
  *
  * The complexity of the Energy Model is defined as:
  *
- *              C = nr_pd * (nr_cpus + nr_cs)
+ *              C = nr_pd * (nr_cpus + nr_ps)
  *
  * with parameters defined as:
  *  - nr_pd:    the number of performance domains
  *  - nr_cpus:  the number of CPUs
- *  - nr_cs:    the sum of the number of capacity states of all performance
+ *  - nr_ps:    the sum of the number of performance states of all performance
  *              domains (for example, on a system with 2 performance domains,
- *              with 10 capacity states each, nr_cs = 2 * 10 = 20).
+ *              with 10 performance states each, nr_ps = 2 * 10 = 20).
  *
  * It is generally not a good idea to use such a model in the wake-up path on
  * very complex platforms because of the associated scheduling overheads. The
  * arbitrary constraint below prevents that. It makes EAS usable up to 16 CPUs
- * with per-CPU DVFS and less than 8 capacity states each, for example.
+ * with per-CPU DVFS and less than 8 performance states each, for example.
  */
 #define EM_MAX_COMPLEXITY 2048
 
 static bool build_perf_domains(const struct cpumask *cpu_map)
 {
-	int i, nr_pd = 0, nr_cs = 0, nr_cpus = cpumask_weight(cpu_map);
+	int i, nr_pd = 0, nr_ps = 0, nr_cpus = cpumask_weight(cpu_map);
 	struct perf_domain *pd = NULL, *tmp;
 	int cpu = cpumask_first(cpu_map);
 	struct root_domain *rd = cpu_rq(cpu)->rd;
@@ -364,6 +370,14 @@ static bool build_perf_domains(const struct cpumask *cpu_map)
 	}
 #endif
 
+	if (!arch_scale_freq_invariant()) {
+		if (sched_debug()) {
+			pr_warn("rd %*pbl: Disabling EAS: frequency-invariant load tracking not yet supported",
+				cpumask_pr_args(cpu_map));
+		}
+		goto free;
+	}
+
 	for_each_cpu(i, cpu_map) {
 		/* Skip already covered CPUs. */
 		if (find_pd(pd, i))
@@ -377,15 +391,15 @@ static bool build_perf_domains(const struct cpumask *cpu_map)
 		pd = tmp;
 
 		/*
-		 * Count performance domains and capacity states for the
+		 * Count performance domains and performance states for the
 		 * complexity check.
 		 */
 		nr_pd++;
-		nr_cs += em_pd_nr_cap_states(pd->em_pd);
+		nr_ps += em_pd_nr_perf_states(pd->em_pd);
 	}
 
 	/* Bail out if the Energy Model complexity is too high. */
-	if (nr_pd * (nr_cs + nr_cpus) > EM_MAX_COMPLEXITY) {
+	if (nr_pd * (nr_ps + nr_cpus) > EM_MAX_COMPLEXITY) {
 		WARN(1, "rd %*pbl: Failed to start EAS, EM complexity is too high\n",
 						cpumask_pr_args(cpu_map));
 		goto free;

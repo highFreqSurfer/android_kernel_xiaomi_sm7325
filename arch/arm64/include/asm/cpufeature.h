@@ -741,7 +741,14 @@ static inline u32 id_aa64mmfr0_parange_to_phys_shift(int parange)
 #ifdef CONFIG_ARM64_AMU_EXTN
 /* Check whether the cpu supports the Activity Monitors Unit (AMU) */
 extern bool cpu_has_amu_feat(int cpu);
+#else
+static inline bool cpu_has_amu_feat(int cpu)
+{
+	return false;
+}
 #endif
+
+extern int get_cpu_with_amu_feat(void);
 
 /* Check whether hardware update of the Access flag is supported */
 static inline bool cpu_has_hw_af(void)
