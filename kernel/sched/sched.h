@@ -193,9 +193,11 @@ struct walt_sched_cluster {
 	int			id;
 	/*
 	 * max_possible_freq = maximum supported by hardware
+	 * max_freq = max freq as per cpufreq limits
 	 */
 	unsigned int		cur_freq;
 	unsigned int		max_possible_freq;
+	unsigned int		max_freq;
 	u64			aggr_grp_load;
 };
 
@@ -849,12 +851,6 @@ struct perf_domain {
 	struct rcu_head rcu;
 };
 
-struct max_cpu_capacity {
-	raw_spinlock_t lock;
-	unsigned long val;
-	int cpu;
-};
-
 /* Scheduling group status flags */
 #define SG_OVERLOAD		0x1 /* More than one runnable task on a CPU. */
 #define SG_OVERUTILIZED		0x2 /* One or more CPUs are over-utilized. */
@@ -914,8 +910,7 @@ struct root_domain {
 	cpumask_var_t		rto_mask;
 	struct cpupri		cpupri;
 
-	/* Maximum cpu capacity in the system. */
-	struct max_cpu_capacity max_cpu_capacity;
+	unsigned long		max_cpu_capacity;
 
 	/*
 	 * NULL-terminated list of performance domains intersecting with the
@@ -929,7 +924,6 @@ struct root_domain {
 };
 
 extern void init_defrootdomain(void);
-extern void init_max_cpu_capacity(struct max_cpu_capacity *mcc);
 extern int sched_init_domains(const struct cpumask *cpu_map);
 extern void rq_attach_root(struct rq *rq, struct root_domain *rd);
 extern void sched_get_rd(struct root_domain *rd);
@@ -1090,6 +1084,9 @@ struct rq {
 	struct sched_avg	avg_dl;
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	struct sched_avg	avg_irq;
+#endif
+#ifdef CONFIG_SCHED_THERMAL_PRESSURE
+	struct sched_avg	avg_thermal;
 #endif
 	u64			idle_stamp;
 	u64			avg_idle;
@@ -1259,6 +1256,24 @@ static inline u64 rq_clock_task(struct rq *rq)
 	assert_clock_updated(rq);
 
 	return rq->clock_task;
+}
+
+/**
+ * By default the decay is the default pelt decay period.
+ * The decay shift can change the decay period in
+ * multiples of 32.
+ *  Decay shift		Decay period(ms)
+ *	0			32
+ *	1			64
+ *	2			128
+ *	3			256
+ *	4			512
+ */
+extern int sched_thermal_decay_shift;
+
+static inline u64 rq_clock_thermal(struct rq *rq)
+{
+	return rq_clock_task(rq) >> sched_thermal_decay_shift;
 }
 
 static inline void rq_clock_skip_update(struct rq *rq)
@@ -2180,15 +2195,6 @@ static inline u64 sched_ktime_clock(void)
 #ifndef arch_scale_freq_capacity
 static __always_inline
 unsigned long arch_scale_freq_capacity(int cpu)
-{
-	return SCHED_CAPACITY_SCALE;
-}
-#endif
-
-#ifndef arch_scale_max_freq_capacity
-struct sched_domain;
-static __always_inline
-unsigned long arch_scale_max_freq_capacity(struct sched_domain *sd, int cpu)
 {
 	return SCHED_CAPACITY_SCALE;
 }
@@ -3178,8 +3184,6 @@ static inline void walt_fixup_cum_window_demand(struct rq *rq, s64 scaled_delta)
 		rq->wrq.cum_window_demand_scaled = 0;
 }
 
-extern unsigned long thermal_cap(int cpu);
-
 extern void clear_walt_request(int cpu);
 
 extern enum sched_boost_policy sched_boost_policy(void);
@@ -3329,13 +3333,6 @@ static inline int alloc_related_thread_groups(void) { return 0; }
 
 static inline void walt_fixup_cum_window_demand(struct rq *rq,
 						s64 scaled_delta) { }
-
-#ifdef CONFIG_SMP
-static inline unsigned long thermal_cap(int cpu)
-{
-	return cpu_rq(cpu)->cpu_capacity_orig;
-}
-#endif
 
 static inline void clear_walt_request(int cpu) { }
 

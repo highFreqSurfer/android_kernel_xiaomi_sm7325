@@ -178,6 +178,19 @@ DEFINE_PER_CPU_READ_MOSTLY(int, sched_load_boost);
  */
 static DEFINE_PER_CPU(unsigned int, nr_pinned_tasks);
 
+int sched_thermal_decay_shift;
+static int __init setup_sched_thermal_decay_shift(char *str)
+{
+	int _shift = 0;
+
+	if (kstrtoint(str, 0, &_shift))
+		pr_warn("Unable to set scheduler thermal pressure decay shift parameter\n");
+
+	sched_thermal_decay_shift = clamp(_shift, 0, 10);
+	return 1;
+}
+__setup("sched_thermal_decay_shift=", setup_sched_thermal_decay_shift);
+
 #ifdef CONFIG_SMP
 /*
  * For asym packing, by default the lower numbered CPU has higher priority.
@@ -3974,7 +3987,7 @@ static inline bool task_fits_capacity(struct task_struct *p,
 static inline bool task_fits_max(struct task_struct *p, int cpu)
 {
 	unsigned long capacity = capacity_orig_of(cpu);
-	unsigned long max_capacity = cpu_rq(cpu)->rd->max_cpu_capacity.val;
+	unsigned long max_capacity = max_possible_capacity;
 	unsigned long task_boost = per_task_boost(p);
 
 	if (capacity == max_capacity)
@@ -3997,7 +4010,7 @@ static inline bool task_fits_max(struct task_struct *p, int cpu)
 static inline bool task_demand_fits(struct task_struct *p, int cpu)
 {
 	unsigned long capacity = capacity_orig_of(cpu);
-	unsigned long max_capacity = cpu_rq(cpu)->rd->max_cpu_capacity.val;
+	unsigned long max_capacity = max_possible_capacity;
 
 	if (capacity == max_capacity)
 		return true;
@@ -8793,6 +8806,9 @@ static inline bool others_have_blocked(struct rq *rq)
 	if (READ_ONCE(rq->avg_dl.util_avg))
 		return true;
 
+	if (thermal_load_avg(rq))
+		return true;
+
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	if (READ_ONCE(rq->avg_irq.util_avg))
 		return true;
@@ -8818,6 +8834,7 @@ static bool __update_blocked_others(struct rq *rq, bool *done)
 {
 	const struct sched_class *curr_class;
 	u64 now = rq_clock_pelt(rq);
+	unsigned long thermal_pressure;
 	bool decayed;
 
 	/*
@@ -8826,8 +8843,11 @@ static bool __update_blocked_others(struct rq *rq, bool *done)
 	 */
 	curr_class = rq->curr->sched_class;
 
+	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
+
 	decayed = update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
 		  update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
+		  update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure) |
 		  update_irq_load_avg(rq, 0);
 
 	if (others_have_blocked(rq))
@@ -9041,9 +9061,10 @@ static inline void init_sd_lb_stats(struct sd_lb_stats *sds)
 	};
 }
 
-static unsigned long scale_rt_capacity(int cpu, unsigned long max)
+static unsigned long scale_rt_capacity(struct sched_domain *sd, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
+	unsigned long max = arch_scale_cpu_capacity(cpu);
 	unsigned long used, free;
 	unsigned long irq;
 
@@ -9052,8 +9073,15 @@ static unsigned long scale_rt_capacity(int cpu, unsigned long max)
 	if (unlikely(irq >= max))
 		return 1;
 
+	/*
+	 * avg_rt.util_avg and avg_dl.util_avg track binary signals
+	 * (running and not running) with weights 0 and 1024 respectively.
+	 * avg_thermal.load_avg tracks thermal pressure and the weighted
+	 * average uses the actual delta max capacity(load).
+	 */
 	used = READ_ONCE(rq->avg_rt.util_avg);
 	used += READ_ONCE(rq->avg_dl.util_avg);
+	used += thermal_load_avg(rq);
 
 	if (unlikely(used >= max))
 		return 1;
@@ -9063,27 +9091,47 @@ static unsigned long scale_rt_capacity(int cpu, unsigned long max)
 	return scale_irq_capacity(free, irq, max);
 }
 
-void init_max_cpu_capacity(struct max_cpu_capacity *mcc) {
-	raw_spin_lock_init(&mcc->lock);
-	mcc->val = 0;
-	mcc->cpu = -1;
+#ifdef CONFIG_SCHED_WALT
+static inline void walt_update_cpu_capacity(int cpu, unsigned long *capacity)
+{
+	unsigned long fmax_capacity = arch_scale_cpu_capacity(cpu);
+	unsigned long thermal_pressure = arch_scale_thermal_pressure(cpu);
+	unsigned long thermal_cap;
+	unsigned long rt_pressure = fmax_capacity - *capacity;
+	struct walt_sched_cluster *cluster;
+	struct rq *rq = cpu_rq(cpu);
+
+	/*
+	 * thermal_pressure = max_capacity - curr_cap_as_per_thermal.
+	 * so,
+	 * curr_cap_as_per_thermal = max_capacity - thermal_pressure.
+	 */
+	thermal_cap = fmax_capacity - thermal_pressure;
+
+	cluster = cpu_cluster(cpu);
+	/* reduce the fmax_capacity under cpufreq constraints */
+	if (cluster->max_freq != cluster->max_possible_freq)
+		fmax_capacity = mult_frac(fmax_capacity, cluster->max_freq,
+					 cluster->max_possible_freq);
+
+	rq->cpu_capacity_orig = min(fmax_capacity, thermal_cap);
+	*capacity = max(rq->cpu_capacity_orig - rt_pressure, 1UL);
 }
+#endif
 
 static void update_cpu_capacity(struct sched_domain *sd, int cpu)
 {
-	unsigned long capacity = arch_scale_cpu_capacity(cpu);
+	unsigned long capacity = scale_rt_capacity(sd, cpu);
 	struct sched_group *sdg = sd->groups;
 
-	capacity *= arch_scale_max_freq_capacity(sd, cpu);
-	capacity >>= SCHED_CAPACITY_SHIFT;
-
-	capacity = min(capacity, thermal_cap(cpu));
-	cpu_rq(cpu)->cpu_capacity_orig = capacity;
-
-	capacity = scale_rt_capacity(cpu, capacity);
+	cpu_rq(cpu)->cpu_capacity_orig = arch_scale_cpu_capacity(cpu);
 
 	if (!capacity)
 		capacity = 1;
+
+#ifdef CONFIG_SCHED_WALT
+	walt_update_cpu_capacity(cpu, &capacity);
+#endif
 
 	cpu_rq(cpu)->cpu_capacity = capacity;
 	sdg->sgc->capacity = capacity;
@@ -9188,7 +9236,7 @@ check_cpu_capacity(struct rq *rq, struct sched_domain *sd)
 static inline int check_misfit_status(struct rq *rq, struct sched_domain *sd)
 {
 	return rq->misfit_task_load &&
-		(rq->cpu_capacity_orig < rq->rd->max_cpu_capacity.val ||
+		(rq->cpu_capacity_orig < rq->rd->max_cpu_capacity ||
 		 check_cpu_capacity(rq, sd));
 }
 
